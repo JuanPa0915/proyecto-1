@@ -5,7 +5,7 @@ import hashlib
 import requests
 import asyncio
 
-MDS_URL = os.getenv("MDS_URL", "http://localhost:8443")
+MDS_URL = os.getenv("MDS_URL", "http://172.31.34.188:8443")
 DN_ID = os.getenv("DN_ID", "dn1")
 DN_PORT = int(os.getenv("DN_PORT", "8001"))
 DN_URL = os.getenv("DN_URL", f"http://localhost:{DN_PORT}")
