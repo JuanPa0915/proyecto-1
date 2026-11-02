@@ -173,3 +173,14 @@ def commit_file(req: CommitReq, user: str = Depends(get_current_user)):
     conn.commit()
     conn.close()
     return {"message": "Commit exitoso. Replicacion garantizada."}
+
+@app.get("/file_info")
+def get_file_info(path: str, user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
+    c = conn.cursor()
+    c.execute("SELECT block_id FROM file_blocks WHERE path=?", (path,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    return {"block_ids": [r[0] for r in rows], "node_urls": [n["url"] for n in active_nodes.values()]}
