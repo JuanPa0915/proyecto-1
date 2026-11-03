@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.bin
+*.txt
+*.log
+dfsha.db
+.dfsha_token
+storage_dn1/
+storage_dn2/
+storage_dn3/
+*.docx

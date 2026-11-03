@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pydantic
 requests
+
+passlib[bcrypt]
+pyjwt
