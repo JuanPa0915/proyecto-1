@@ -1,215 +1,210 @@
-import os
-import sqlite3
-import datetime
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from passlib.context import CryptContext
-import jwt
-from fastapi.security import OAuth2PasswordBearer
-import itertools
+import sqlite3, jwt, time, asyncio, os
+from typing import List, Optional
 
-app = FastAPI(title="MDS DFSha Fase II - Bloques")
+app = FastAPI(title="DFSha - MDS")
 
 SECRET_KEY = "secreto-fase2-dfsha"
-ALGORITHM = "HS256"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-DB_FILE = "dfsha.db"
-
-# Nodos harcodeados por requerimiento
-NODES = [
-    "http://172.31.43.252:8001",
-    "http://172.31.43.252:8002",
-    "http://172.31.43.252:8003"
-]
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Estado en memoria de los Data Nodes
+active_nodes = {}
 
 def init_db():
-    conn = get_db()
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS active_nodes (node_url TEXT PRIMARY KEY, last_seen TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, username TEXT, locked_at TIMESTAMP)''')
-    # Tabla metadata 
-    c.execute('''CREATE TABLE IF NOT EXISTS file_metadata (path TEXT PRIMARY KEY, size INTEGER, checksum TEXT, uploaded_by TEXT, uploaded_at TIMESTAMP)''')
-    # Tabla manifest para mapear archivo -> bloques -> nodos
-    c.execute('''CREATE TABLE IF NOT EXISTS file_manifest (path TEXT, block_index INTEGER, block_id TEXT, checksum TEXT, node_url TEXT)''')
-    
-    # Usuario por defecto admin/admin123
-    c.execute("SELECT * FROM users WHERE username='admin'")
-    if not c.fetchone():
-        hashed = pwd_context.hash("admin123")
-        c.execute("INSERT INTO users VALUES (?, ?)", ("admin", hashed))
+    c.execute('''CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, is_dir BOOLEAN, owner TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS locks (path TEXT PRIMARY KEY, owner TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS file_blocks (path TEXT, block_id TEXT, node_id TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS file_manifest (path TEXT, idx INTEGER, block_id TEXT, nodes TEXT, PRIMARY KEY (path, idx))''')
     conn.commit()
     conn.close()
 
 init_db()
 
-class LoginData(BaseModel):
+# --- BACKGROUND TASK: Monitor de Nodos ---
+async def monitor_nodes():
+    while True:
+        current_time = time.time()
+        for node_id, data in list(active_nodes.items()):
+            if current_time - data['last_heartbeat'] > 10:
+                print(f"[Monitor] Nodo {node_id} marcado como DEAD")
+                del active_nodes[node_id]
+        await asyncio.sleep(5)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(monitor_nodes())
+
+# --- SEGURIDAD Y AUTH ---
+class UserAuth(BaseModel):
     username: str
     password: str
 
-class PathRequest(BaseModel):
-    path: str
-
-class AssignRequest(BaseModel):
-    path: str
-    blocks: int
-
-class BlockInfo(BaseModel):
-    block_id: str
-    checksum: str
-    nodes: list[str]
-
-class CommitRequest(BaseModel):
-    path: str
-    checksum: str
-    blocks: list[BlockInfo]
-    size: int
-
-def verify_token(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub")
-    except:
-        raise HTTPException(status_code=401, detail="Token invalido o expirado")
-
-def get_active_nodes():
-    conn = get_db()
+@app.post("/register")
+def register(user: UserAuth):
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
-    limit = datetime.datetime.now() - datetime.timedelta(seconds=12) # Ajuste: 12 segundos
-    c.execute("SELECT node_url FROM active_nodes WHERE last_seen > ?", (limit,))
-    nodes = [row["node_url"] for row in c.fetchall()]
-    conn.close()
-    return nodes
+    try:
+        hashed = pwd_context.hash(user.password)
+        c.execute("INSERT INTO users VALUES (?, ?)", (user.username, hashed))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Usuario ya existe")
+    finally:
+        conn.close()
+    return {"message": "Registrado correctamente"}
 
 @app.post("/login")
-def login(data: LoginData):
-    conn = get_db()
+def login(user: UserAuth):
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username=?", (data.username,))
-    user = c.fetchone()
+    c.execute("SELECT password_hash FROM users WHERE username=?", (user.username,))
+    row = c.fetchone()
     conn.close()
-    if user and pwd_context.verify(data.password, user["password_hash"]):
-        token = jwt.encode({"sub": data.username, "exp": datetime.datetime.now() + datetime.timedelta(hours=2)}, SECRET_KEY, algorithm=ALGORITHM)
-        return {"access_token": token, "token_type": "bearer"}
-    raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-
-@app.post("/heartbeat")
-def heartbeat(node_url: str):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO active_nodes VALUES (?, ?)", (node_url, datetime.datetime.now()))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-@app.post("/lock")
-def lock_file(req: PathRequest, username: str = Depends(verify_token)):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT username FROM file_locks WHERE path=?", (req.path,))
-    lock = c.fetchone()
-    if lock and lock["username"] != username:
-        conn.close()
-        raise HTTPException(status_code=423, detail="Bloqueado por otro proceso")
+    if not row or not pwd_context.verify(user.password, row[0]):
+        raise HTTPException(status_code=401, detail="Credenciales invalidas")
     
-    c.execute("INSERT OR REPLACE INTO file_locks VALUES (?, ?, ?)", (req.path, username, datetime.datetime.now()))
-    conn.commit()
-    conn.close()
-    return {"message": "Lock adquirido"}
+    token = jwt.encode({"sub": user.username, "exp": time.time() + 3600}, SECRET_KEY, algorithm="HS256")
+    return {"token": token}
+
+def get_current_user(authorization: str = Header(None)):
+    if not authorization: raise HTTPException(status_code=401, detail="Token faltante")
+    try:
+        token = authorization.replace("Bearer ", "")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload["sub"]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token invalido")
+
+# --- CONCURRENCIA (LOCKS) ---
+@app.post("/lock")
+def acquire_lock(path: str, user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO locks VALUES (?, ?)", (path, user))
+        conn.commit()
+        return {"message": "Lock adquirido"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Archivo ya bloqueado por otro usuario")
+    finally:
+        conn.close()
 
 @app.post("/unlock")
-def unlock_file(req: PathRequest, username: str = Depends(verify_token)):
-    conn = get_db()
+def release_lock(path: str, user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
-    c.execute("DELETE FROM file_locks WHERE path=? AND username=?", (req.path, username))
+    c.execute("DELETE FROM locks WHERE path=? AND owner=?", (path, user))
+    released = c.rowcount
     conn.commit()
     conn.close()
+    if released == 0:
+        raise HTTPException(status_code=403, detail="No tienes el lock o no existe")
     return {"message": "Lock liberado"}
 
-@app.post("/assign")
-def assign_blocks(req: AssignRequest, username: str = Depends(verify_token)):
-    active = get_active_nodes()
-    if len(active) < 2:
-        raise HTTPException(status_code=503, detail="Insuficientes nodos activos para replicacion (minimo 2)")
-    
-    # Rotacion (Round-Robin) para distribuir carga
-    assignments = []
-    pool = itertools.cycle(active)
-    
-    for i in range(req.blocks):
-        replica1 = next(pool)
-        replica2 = next(pool)
-        while replica1 == replica2:
-            replica2 = next(pool)
-        assignments.append({"block_index": i, "nodes": [replica1, replica2]})
-
-    return {"assignments": assignments}
-
-@app.post("/commit")
-def commit_upload(req: CommitRequest, username: str = Depends(verify_token)):
-    conn = get_db()
+# --- JERARQUÍA (ls, rmdir) ---
+@app.get("/ls")
+def list_files(path: str = "", user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
-    
-    # Solo puede confirmar quien tiene el lock
-    c.execute("SELECT username FROM file_locks WHERE path=?", (req.path,))
-    lock = c.fetchone()
-    if not lock or lock["username"] != username:
-         conn.close()
-         raise HTTPException(status_code=403, detail="No tienes el bloqueo para confirmar este archivo")
+    if path and not path.endswith('/'): path += '/'
+    # Filtra archivos que esten estrictamente bajo esta ruta
+    c.execute("SELECT path, is_dir FROM files WHERE path LIKE ?", (f"{path}%",))
+    rows = c.fetchall()
+    conn.close()
+    return {"files": [{"path": r[0], "is_dir": bool(r[1])} for r in rows]}
 
-    # Limpiar metadata y bloques viejos si el archivo ya existia
-    c.execute("DELETE FROM file_metadata WHERE path=?", (req.path,))
-    c.execute("DELETE FROM file_manifest WHERE path=?", (req.path,))
-    
-    c.execute("INSERT INTO file_metadata VALUES (?, ?, ?, ?, ?)", 
-              (req.path, req.size, req.checksum, username, datetime.datetime.now()))
-    
-    for idx, block in enumerate(req.blocks):
-        unique_nodes = list(set(block.nodes))
-        if len(unique_nodes) < 2:
-            conn.rollback()
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"El bloque {block.block_id} no cumple la replicacion requerida (tiene {len(unique_nodes)} replicas)")
-        for node in unique_nodes:
-            c.execute("INSERT INTO file_manifest VALUES (?, ?, ?, ?, ?)",
-                      (req.path, idx, block.block_id, block.checksum, node))
-            
+@app.delete("/rmdir")
+def remove_dir(path: str, user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
+    c = conn.cursor()
+    if not path.endswith('/'): path += '/'
+    c.execute("SELECT count(*) FROM files WHERE path LIKE ? AND path != ?", (f"{path}%", path))
+    if c.fetchone()[0] > 0:
+        raise HTTPException(status_code=400, detail="El directorio no esta vacio")
+    c.execute("DELETE FROM files WHERE path=? AND owner=?", (path, user))
     conn.commit()
     conn.close()
-    return {"message": "Transaccion finalizada"}
+    return {"message": "Directorio eliminado"}
+
+# --- HEARTBEAT Y COMUNICACIÓN INTERNA ---
+class HeartbeatReq(BaseModel):
+    dn_id: str
+    url: str
+
+@app.post("/internal/heartbeat")
+def heartbeat(req: HeartbeatReq):
+    active_nodes[req.dn_id] = {"url": req.url, "last_heartbeat": time.time()}
+    return {"status": "ALIVE"}
+
+# --- ASIGNACIÓN Y COMMIT (varios bloques) ---
+REPLICAS = 2
+
+@app.post("/assign")
+def assign_blocks(path: str, blocks: int, user: str = Depends(get_current_user)):
+    nodes = list(active_nodes.values())
+    if len(nodes) < REPLICAS:
+        raise HTTPException(status_code=503, detail="No hay suficientes Data Nodes para garantizar replicación (Min 2)")
+    if blocks < 1:
+        raise HTTPException(status_code=400, detail="blocks debe ser >= 1")
+
+    # Reparto rotativo: el bloque i usa los nodos i, i+1 (en circulo)
+    result = []
+    for i in range(blocks):
+        replicas = [nodes[(i + k) % len(nodes)]["url"] for k in range(REPLICAS)]
+        result.append({"index": i, "replicas": replicas})
+    return {"blocks": result}
+
+class BlockInfo(BaseModel):
+    index: int
+    block_id: str
+    nodes: List[str]
+
+class CommitReq(BaseModel):
+    path: str
+    blocks: List[BlockInfo]
+
+@app.post("/commit")
+def commit_file(req: CommitReq, user: str = Depends(get_current_user)):
+    # Cada bloque debe estar en al menos 2 nodos distintos
+    for b in req.blocks:
+        if len(set(b.nodes)) < REPLICAS:
+            raise HTTPException(status_code=503, detail=f"Bloque {b.index} no alcanzo factor de replicacion {REPLICAS}")
+
+    conn = sqlite3.connect("dfsha.db")
+    c = conn.cursor()
+    # Solo puede confirmar quien tiene el lock
+    c.execute("SELECT owner FROM locks WHERE path=?", (req.path,))
+    row = c.fetchone()
+    if not row or row[0] != user:
+        conn.close()
+        raise HTTPException(status_code=403, detail="No tienes el lock de este archivo")
+
+    # Todo en una sola transaccion: el manifiesto nuevo reemplaza al viejo de golpe
+    c.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?)", (req.path, False, user))
+    c.execute("DELETE FROM file_manifest WHERE path=?", (req.path,))
+    for b in req.blocks:
+        c.execute("INSERT INTO file_manifest VALUES (?, ?, ?, ?)",
+                  (req.path, b.index, b.block_id, ",".join(b.nodes)))
+    conn.commit()
+    conn.close()
+    return {"message": "Commit exitoso. Replicacion garantizada.", "blocks": len(req.blocks)}
 
 @app.get("/file_info")
-def get_file_info(path: str, username: str = Depends(verify_token)):
-    conn = get_db()
+def get_file_info(path: str, user: str = Depends(get_current_user)):
+    conn = sqlite3.connect("dfsha.db")
     c = conn.cursor()
-    c.execute("SELECT * FROM file_metadata WHERE path=?", (path,))
-    meta = c.fetchone()
-    if not meta:
+    c.execute("SELECT 1 FROM files WHERE path=? AND is_dir=0", (path,))
+    if not c.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
-    
-    c.execute("SELECT block_id, checksum, node_url FROM file_manifest WHERE path=? ORDER BY block_index", (path,))
-    manifest_rows = c.fetchall()
+    c.execute("SELECT idx, block_id, nodes FROM file_manifest WHERE path=? ORDER BY idx", (path,))
+    rows = c.fetchall()
     conn.close()
-    
-    # Agrupar nodos por bloque
-    blocks_dict = {}
-    for row in manifest_rows:
-        bid = row["block_id"]
-        if bid not in blocks_dict:
-            blocks_dict[bid] = {"block_id": bid, "checksum": row["checksum"], "nodes": []}
-        blocks_dict[bid]["nodes"].append(row["node_url"])
-
-    return {
-        "path": meta["path"],
-        "size": meta["size"],
-        "checksum": meta["checksum"],
-        "blocks": list(blocks_dict.values())
-    }
+    return {"blocks": [{"index": r[0], "block_id": r[1], "nodes": r[2].split(",")} for r in rows]}
